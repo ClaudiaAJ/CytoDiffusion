@@ -114,11 +114,12 @@ class PoincareHead(nn.Module):
 
     def log0(self, z):
         sc = self.c ** 0.5
-        n = z.norm(dim=-1, keepdim=True).clamp(1e-9, 1 - 1e-5)
+        n = z.norm(dim=-1, keepdim=True).clamp(1e-9, (1 - 1e-5) / sc)  # ball radius is 1/sqrt(c)
         return torch.atanh(sc * n) * z / (sc * n)
 
     def radius(self, z):
-        return 2 * torch.atanh(z.norm(dim=-1).clamp(max=1 - 1e-5)) / self.c ** 0.5
+        sc = self.c ** 0.5
+        return 2 * torch.atanh((sc * z.norm(dim=-1)).clamp(max=1 - 1e-5)) / sc
 
     def prototypes(self):
         return self.exp0(self.proto_tangent)

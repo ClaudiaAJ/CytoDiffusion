@@ -128,15 +128,92 @@ At 64-d, held-out placement is the same for both geometries (excess 1.2-1.3). At
 | 8 | platelet | Euclid | 1 | 0.42 | 0.67 | 83.7 | 77.1 |
 | 8 | platelet | Poincaré | 2 | 0.23 | 0.70 | 85.4 | 78.1 |
 
-- The dim-4 frozen result (Poincaré neighbour match) did not appear when fine-tuned: 0/3 seeds with the best-possible neighbour for either head on either class; the nearest known class is mostly artefact (tree distance 3 for erythroblast, 3 for platelet in this run set).
+- The dim-4 frozen result (Poincaré neighbour match) did not appear when fine-tuned: 0/3 seeds with the best-possible neighbour for either head on either class. Held-out erythroblast's nearest known class is artefact in all 6 runs (excess 3). Held-out platelet's nearest known class is lymphocyte, artefact, ig or blast (excess 3, or 2 when blast).
 - Held-out radius ratio is 0.66-0.79 in both geometries (held-out classes sit closer to the origin than known classes).
 - rho is higher for Euclidean in all four paired cells.
 - Dim 8 is incomplete (cancelled): seed 1 platelet Euclid and all of seed 2 are missing.
 
+## B5. Mixup control (frozen features with feature-space mixup 0.3)
+Setup: the frozen hold-out grid was re-run with mixup alpha 0.3 on the cached feature vectors, mixing the one-hot or soft labels and the depth target by the same weight (same as the fine-tuned loop). 10 hold-outs x 2 heads x {flat, hierarchy} x 3 seeds, at 64-d and 4-d, otherwise identical to B2 (300 steps). Dim 8 and dim 2 were not re-run.
+
+| dim | head | config | rho | acc % | balanced % | mean excess | held-out radius ratio |
+|---|---|---|---|---|---|---|---|
+| 64 | Poincaré | flat | 0.14 -> 0.14 | 78.4 -> 77.1 | 70.3 -> 67.0 | 1.30 -> 1.60 | 0.92 -> 0.95 |
+| 64 | Poincaré | hierarchy | 0.37 -> 0.35 | 77.9 -> 76.8 | 65.3 -> 61.9 | 1.27 -> 0.90 | 0.98 -> 0.98 |
+| 64 | Euclid | flat | 0.18 -> 0.15 | 78.6 -> 77.8 | 70.5 -> 68.1 | 1.30 -> 1.70 | 0.86 -> 0.93 |
+| 64 | Euclid | hierarchy | 0.50 -> 0.49 | 77.7 -> 76.5 | 63.3 -> 60.4 | 1.20 -> 1.00 | 0.97 -> 0.97 |
+| 4 | Poincaré | flat | 0.16 -> 0.16 | 66.7 -> 65.1 | 39.7 -> 35.6 | 1.10 -> 0.87 | 0.96 -> 0.97 |
+| 4 | Poincaré | hierarchy | 0.32 -> 0.31 | 63.5 -> 63.1 | 31.7 -> 30.1 | 0.73 -> 0.87 | 0.99 -> 0.99 |
+| 4 | Euclid | flat | 0.17 -> 0.13 | 70.3 -> 69.9 | 52.2 -> 49.5 | 1.30 -> 1.33 | 0.75 -> 0.81 |
+| 4 | Euclid | hierarchy | 0.49 -> 0.45 | 66.3 -> 65.6 | 38.4 -> 37.4 | 1.40 -> 1.07 | 0.95 -> 0.97 |
+
+(each cell: without mixup -> with mixup; excess is averaged over seeds here, not taken per class as in B2)
+
+- Mixup lowers accuracy by 0.4-1.6 points and balanced accuracy by 1-3.5 points. Rho changes by at most 0.04.
+- Euclidean rho stays above Poincaré rho under hierarchy training (0.49 vs 0.35 at 64-d, 0.45 vs 0.31 at 4-d).
+- At dim 4 with hierarchy, the Poincaré-vs-Euclid gap in mean excess falls from 0.67 (0.73 vs 1.40) to 0.20 (0.87 vs 1.07).
+- At 64-d, mean excess changes by 0.2-0.4 in either direction depending on the cell. No significance test was run.
+- Number of hold-out classes whose nearest known class is a best-possible tree neighbour (in at least 2 of 3 seeds), without -> with mixup: dim 4 Poincaré hierarchy 7 -> 6, Euclid hierarchy 4 -> 6; dim 64 Poincaré hierarchy 4 -> 6, Euclid hierarchy 4 -> 5.
+- Feature-space mixup is not image mixup, and RandAugment is not reproduced, so the arms are still not identical.
+
+Files: `holdout_mixup/results_dim{64,4}.log`, `holdout_mixup/run.sh`; harness flag `--mixup 0.3`.
+
+## B6. Curvature sweep (frozen features, no mixup)
+Setup: Poincaré head with c in {0.1, 0.25, 0.5, 1, 2, 4}, everything else identical to B2 (runnorm, target norm 1, tau 0.1, 300 steps, soft labels + depth loss for the hierarchy config), 10 hold-outs x {flat, hierarchy} x 3 seeds, at 64-d and 4-d. The Euclidean head is the c -> 0 limit. The c=1 rerun reproduces the original c=1 numbers exactly.
+Before this sweep, `radius()` and `log0()` in `train_and_test_hyperbolic.py` were corrected to use the ball radius 1/sqrt(c) (they assumed 1). At c=1 results are unchanged; earlier results are unaffected.
+Columns: rho, accuracy %, balanced accuracy %, mean excess, number of hold-out classes (of 10) with a best-possible nearest neighbour in at least 2 of 3 seeds, held-out radius ratio.
+
+**64-d**
+
+| c | config | rho | acc | bal | excess | #best | radius ratio |
+|---|---|---|---|---|---|---|---|
+| 0 (Euclid) | flat | 0.18 | 78.6 | 70.5 | 1.30 | 5 | 0.86 |
+| 0 (Euclid) | hier. | 0.50 | 77.7 | 63.3 | 1.20 | 4 | 0.97 |
+| 0.1 | flat | 0.20 | 77.9 | 69.1 | 1.30 | 5 | 0.95 |
+| 0.1 | hier. | 0.48 | 77.2 | 62.8 | 1.13 | 5 | 0.99 |
+| 0.25 | flat | 0.19 | 78.0 | 69.2 | 1.30 | 5 | 0.95 |
+| 0.25 | hier. | 0.47 | 77.3 | 63.1 | 1.13 | 5 | 0.98 |
+| 0.5 | flat | 0.17 | 78.1 | 69.7 | 1.30 | 5 | 0.94 |
+| 0.5 | hier. | 0.46 | 77.5 | 63.9 | 1.33 | 4 | 0.98 |
+| 1 | flat | 0.14 | 78.4 | 70.3 | 1.30 | 5 | 0.92 |
+| 1 | hier. | 0.37 | 77.9 | 65.3 | 1.27 | 4 | 0.98 |
+| 2 | flat | 0.10 | 78.5 | 70.9 | 1.23 | 5 | 0.89 |
+| 2 | hier. | 0.20 | 78.1 | 65.7 | 1.00 | 5 | 0.97 |
+| 4 | flat | 0.05 | 78.5 | 70.1 | 1.37 | 5 | 0.86 |
+| 4 | hier. | 0.04 | 77.2 | 63.0 | 1.63 | 3 | 0.96 |
+
+**4-d**
+
+| c | config | rho | acc | bal | excess | #best | radius ratio |
+|---|---|---|---|---|---|---|---|
+| 0 (Euclid) | flat | 0.17 | 70.3 | 52.2 | 1.30 | 4 | 0.75 |
+| 0 (Euclid) | hier. | 0.49 | 66.3 | 38.4 | 1.40 | 4 | 0.95 |
+| 0.1 | flat | 0.17 | 68.1 | 48.9 | 1.13 | 4 | 0.83 |
+| 0.1 | hier. | 0.47 | 65.0 | 39.1 | 1.23 | 4 | 0.98 |
+| 0.25 | flat | 0.18 | 67.8 | 47.3 | 1.20 | 4 | 0.90 |
+| 0.25 | hier. | 0.43 | 65.5 | 35.9 | 1.07 | 6 | 0.99 |
+| 0.5 | flat | 0.18 | 67.5 | 44.0 | 1.30 | 4 | 0.91 |
+| 0.5 | hier. | 0.37 | 64.9 | 34.0 | 0.87 | 6 | 0.99 |
+| 1 | flat | 0.16 | 66.7 | 39.7 | 1.10 | 6 | 0.96 |
+| 1 | hier. | 0.32 | 63.5 | 31.7 | 0.73 | 7 | 0.99 |
+| 2 | flat | 0.16 | 64.5 | 33.9 | 1.13 | 4 | 0.97 |
+| 2 | hier. | 0.26 | 62.0 | 28.2 | 0.73 | 6 | 0.99 |
+| 4 | flat | 0.15 | 61.9 | 30.2 | 1.17 | 5 | 0.97 |
+| 4 | hier. | 0.20 | 59.9 | 25.9 | 1.13 | 5 | 0.99 |
+
+- Under hierarchy training, rho decreases as curvature increases: 0.48 -> 0.04 (64-d) and 0.47 -> 0.20 (4-d) from c=0.1 to c=4. The Euclidean values (0.50, 0.49) continue the same curve. Flat rho is 0.15-0.18 at 4-d for all c and falls from 0.20 to 0.05 at 64-d.
+- Accuracy at 64-d is 77.2-78.5% for all c. At 4-d, accuracy falls from 68.1% (c=0.1) to 61.9% (c=4) for flat labels and from 65.0% to 59.9% for hierarchy; balanced accuracy falls from 48.9 to 30.2 (flat) and from 39.1 to 25.9 (hierarchy).
+- Mean excess at 64-d has no clear trend with c (hierarchy: 1.13, 1.13, 1.33, 1.27, 1.00, 1.63; Euclid 1.20).
+- At 4-d with hierarchy, mean excess is lowest at c=1 and c=2 (0.73), 0.87 at c=0.5, against 1.40 for Euclid and 1.13 at c=4. The number of best-neighbour hold-outs is 6, 7 and 6 at c=0.5, 1, 2 (Euclid 4). This is an average over 10 classes with 3 seeds each; B5 showed the c=1 gap to Euclid shrinks with mixup (0.87 vs 1.07).
+- The held-out radius ratio is 0.96-0.99 for all hierarchy runs, including Euclid (0.95-0.97).
+- No significance test was run.
+
+Files: `curvature_sweep/results_dim{64,4}_c{c}.log`, `curvature_sweep/run.sh`.
+
 ---
 # C. Limitations
-- Frozen and fine-tuned arms differ (mixup only in fine-tuned).
-- No fine-tuned flat hold-out control at dim 4/8; no contrastive loss; no curvature sweep; curvature fixed c=1.
+- Frozen and fine-tuned arms still differ: B5 adds feature-space mixup to the frozen arm, but images are not mixed and RandAugment is not reproduced. Fine-tuned runs without mixup were not done (about 10 h for hold-outs at dim 4).
+- No fine-tuned flat hold-out control at dim 4/8; no contrastive loss; curvature is swept only on frozen features (B6), fixed at c=1 in the fine-tuned runs.
 - The paper's CytoDiffusion backbone is not used. The stock ViT baseline is 4 points above the paper's ViT row, cause not checked.
 - Seeds: 3 for most cells, 10 for the frozen dim-4 replication and the radius check; dim-8 fine-tuned rows have 1-2 seeds.
 - Tree is my draft (approved by you); distances depend on it.
