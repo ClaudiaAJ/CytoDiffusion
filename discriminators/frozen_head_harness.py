@@ -160,9 +160,21 @@ def run_head(name, a, data, device, seed, holdout_x=None, return_head=False):
         idx = torch.randperm(n, device=device)[: a.batch_size]
         xb, yb = xtr[idx], ytr[idx]
         if a.mixup > 0:
+            # feature-space mixup, with the same label treatment as the fine-tuned loop (soft labels and depth target are mixed too)
             lam = float(np.random.beta(a.mixup, a.mixup)); perm = torch.randperm(xb.shape[0], device=device)
-            out = head(lam * xb + (1 - lam) * xb[perm])
-            loss = lam * F.cross_entropy(out, yb) + (1 - lam) * F.cross_entropy(out, yb[perm])
+            yb2 = yb[perm]
+            out, z = head(lam * xb + (1 - lam) * xb[perm], return_embedding=True)
+            def tgt(y):
+                oh = F.one_hot(y, out.shape[1]).float()
+                if a.soft_t > 0:
+                    q = F.softmax(-a.tree_T[y] / a.soft_t, dim=1)
+                    return (1 - a.soft_mix) * oh + a.soft_mix * q
+                return oh
+            q = lam * tgt(yb) + (1 - lam) * tgt(yb2)
+            loss = -(q * F.log_softmax(out, dim=1)).sum(1).mean()
+            if a.depth_w > 0 and name in ("poincare", "euclid"):
+                r = head.radius(z); dep = lam * a.depth_t[yb] + (1 - lam) * a.depth_t[yb2]
+                loss = loss + a.depth_w * (r / r.mean().detach() - dep / dep.mean()).pow(2).mean()
         else:
             out, z = head(xb, return_embedding=True)
             if a.soft_t > 0:  # tree-aware soft labels: q_k ~ exp(-T[y,k]/soft_t), mixed with one-hot by soft_mix
