@@ -36,6 +36,14 @@ def main():
     a = p.parse_args()
     a.dim, a.c, a.tau, a.lr, a.wd, a.batch_size = 64, 1.0, 0.1, 1e-3, 1e-2, 32
     a.mixup, a.norm_pen, a.eval_every = 0.0, 0.0, a.steps
+    # settings added to the harness later; all off / default so the behaviour is the original flat-label training
+    a.soft_t, a.soft_mix, a.depth_w, a.tree_w, a.tree_scale = 0.0, 0.8, 0.0, 0.0, 1.0
+    a.lr_proto_mult, a.lr_c, a.hid, a.scramble, a.held_name = 1.0, 1e-2, 256, 0, None
+
+    def set_classes(names):  # the harness scores class placement against the tree after training; it needs the class names
+        a.known_names = a.train_names = list(names)
+        a.depth_t = torch.tensor([float(hh.class_tree.depth(n)) for n in names], device=device)
+        a.tree_T = torch.tensor(hh.class_tree.tree_distance_matrix(list(names)), dtype=torch.float32, device=device)
     os.makedirs(a.out_dir, exist_ok=True)
 
     device = torch.device("cuda:0")
@@ -46,11 +54,13 @@ def main():
     K = len(classes)
     R_tr = np.zeros((len(a.seeds), K)); R_ho = np.zeros_like(R_tr); R_oth = np.zeros_like(R_tr)
     for si, seed in enumerate(a.seeds):
+        set_classes(classes)
         head = hh.run_head("poincare", a, full, device, seed, None, return_head=True)[-1]
         for k in range(K):
             R_tr[si, k] = radius(head, xte[yte == k]).mean()
         for k in range(K):
             data_k, _, _ = hh.remap_holdout(full, k)
+            set_classes([c for i, c in enumerate(classes) if i != k])
             head_k = hh.run_head("poincare", a, data_k, device, seed, None, return_head=True)[-1]
             R_ho[si, k] = radius(head_k, xte[yte == k]).mean()
             R_oth[si, k] = radius(head_k, xte[yte != k]).mean()

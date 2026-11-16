@@ -34,11 +34,17 @@ def _norm(x, dim=-1, keepdim=True):
     return x.pow(2).sum(dim=dim, keepdim=keepdim).clamp_min(1e-12).sqrt()
 
 
+MAX_TANH = 1 - 5e-7  # boundary guard for expmap0: sqrt(c)|x| never exceeds this (about 8 float32 steps below 1)
+
+
 def expmap0(v, c):
-    """Tangent vector at the origin -> point in the ball of curvature -c."""
+    """Tangent vector at the origin -> point in the ball of curvature -c.
+    tanh rounds to exactly 1 for long tangent vectors (sqrt(c)|v| above ~9.5 in float32), which would put the point ON the boundary;
+    the clamp keeps it strictly inside. It is inactive for sqrt(c)|v| <= 7.5 (bit-identical output). Between 7.6 and 8 (reachable only
+    with c = 4 and |v| at the clip radius 4) it moves the point by less than 5e-7 relative; distances there are saturated anyway."""
     sc = c ** 0.5
     n = _norm(v)
-    return torch.tanh(sc * n) * v / (sc * n)
+    return torch.tanh(sc * n).clamp(max=MAX_TANH) * v / (sc * n)
 
 
 def mobius_add(x, y, c):
@@ -50,8 +56,20 @@ def mobius_add(x, y, c):
     return num / den.clamp_min(EPS)
 
 
+def max_dist(c):
+    """Largest value poincare_dist can return at curvature c (12.2 at c=1, 6.1 at c=4). See poincare_dist."""
+    return 2 * float(np.arctanh(1 - EPS)) / float(c) ** 0.5
+
+
+def frac_at_cap(D, c, tol=1e-3):
+    """Share of the distances in D that sit at the cap of poincare_dist (within a relative tolerance)."""
+    return float((D >= (1 - tol) * max_dist(c)).float().mean())
+
+
 def poincare_dist(x, y, c):
-    """Pairwise distance. x: (B,d), y: (K,d) -> (B,K)."""
+    """Pairwise distance. x: (B,d), y: (K,d) -> (B,K).
+    The atanh argument is clamped at 1 - EPS (atanh and its gradient diverge at 1), so distances SATURATE at max_dist(c):
+    larger true distances are returned as the cap. Use frac_at_cap to check that an experiment stays below it."""
     sc = c ** 0.5
     diff = mobius_add(-x[:, None, :], y[None, :, :], c)  # (B,K,d)
     n = _norm(diff, keepdim=False)
@@ -85,7 +103,7 @@ class PoincareHead(nn.Module):
         self.log_inv_tau = nn.Parameter(torch.tensor(float(np.log(1.0 / tau))))
 
     def embed(self, feats):
-        v = self.proj(self.feat_norm(feats.float()))
+        v = self._tangent(feats)
         if self.norm_mode == "batchnorm":
             v = self.bn(v) * (self.target_norm / self.dim ** 0.5)
         elif self.norm_mode == "runnorm":
@@ -105,6 +123,15 @@ class PoincareHead(nn.Module):
         v = v * scale
         return self.exp0(v)
 
+    def _tangent(self, feats):
+        """Features -> tangent vector at the origin (before norm control). Overridden by the MLP heads."""
+        return self.proj(self.feat_norm(feats.float()))
+
+    def make_optimizers(self, lr, wd, lr_proto_mult=1.0):
+        protos = [p for n, p in self.named_parameters() if n.startswith("proto")]
+        rest = [p for n, p in self.named_parameters() if not n.startswith("proto")]
+        return [torch.optim.AdamW([{"params": rest}, {"params": protos, "lr": lr * lr_proto_mult}], lr=lr, weight_decay=wd)]
+
     # geometry hooks (overridden by EuclideanHead)
     def exp0(self, v):
         return expmap0(v, self.c)
@@ -114,7 +141,8 @@ class PoincareHead(nn.Module):
 
     def log0(self, z):
         sc = self.c ** 0.5
-        n = z.norm(dim=-1, keepdim=True).clamp(1e-9, (1 - 1e-5) / sc)  # ball radius is 1/sqrt(c)
+        n = z.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+        n = torch.minimum(n, (1 - 1e-5) / sc * torch.ones_like(n))  # ball radius is 1/sqrt(c)
         return torch.atanh(sc * n) * z / (sc * n)
 
     def radius(self, z):
@@ -145,6 +173,209 @@ class EuclideanHead(PoincareHead):
 
     def radius(self, z):
         return z.norm(dim=-1)
+
+
+# ----------------------------------------------------------------------------- stage 1: Riemannian prototypes, learnable curvature
+class RiemannianAdamBall(torch.optim.Optimizer):
+    """Adam for parameters that are points of the UNIT Poincare ball (rows of the tensor).
+    Euclidean gradient -> Riemannian gradient (scaled by ((1-|x|^2)^2)/4), Adam moments on the Riemannian gradient with a
+    per-point second moment, update through the exponential map at x, projection back inside the ball.
+    The momentum is carried to the new point by the conformal factor only (the gyration part of parallel transport is ignored)."""
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8):
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps))
+
+    @torch.no_grad()
+    def step(self):
+        for g in self.param_groups:
+            b1, b2 = g["betas"]
+            for p in g["params"]:
+                if p.grad is None:
+                    continue
+                st = self.state[p]
+                if not st:
+                    st["t"] = 0; st["m"] = torch.zeros_like(p); st["v"] = torch.zeros(p.shape[:-1] + (1,), device=p.device)
+                st["t"] += 1
+                x = p.data
+                one_m = (1 - x.pow(2).sum(-1, keepdim=True)).clamp_min(1e-5)
+                rg = p.grad * one_m.pow(2) / 4
+                st["m"].mul_(b1).add_((1 - b1) * rg)
+                st["v"].mul_(b2).add_((1 - b2) * rg.pow(2).sum(-1, keepdim=True))
+                mh = st["m"] / (1 - b1 ** st["t"]); vh = st["v"] / (1 - b2 ** st["t"])
+                u = -g["lr"] * mh / (vh.sqrt() + g["eps"])          # tangent step at x (ambient coordinates)
+                lam = 2 / one_m                                     # conformal factor at x
+                un = u.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                step_pt = torch.tanh(lam * un / 2) * u / un          # exp_x(u) = x (+) tanh(lam|u|/2) u/|u|
+                new = mobius_add(x, step_pt, 1.0)
+                nn_ = new.norm(dim=-1, keepdim=True)
+                new = torch.where(nn_ >= 1 - 1e-3, new / nn_ * (1 - 1e-3), new)   # keep strictly inside the ball
+                lam_new = 2 / (1 - new.pow(2).sum(-1, keepdim=True)).clamp_min(1e-5)
+                st["m"].mul_(lam / lam_new)
+                p.data.copy_(new)
+
+
+class RiemannianPoincareHead(PoincareHead):
+    """PoincareHead whose prototypes are points on the ball (updated with RiemannianAdamBall) instead of tangent vectors,
+    and (optionally) a learnable curvature. Coordinates: u = sqrt(c) * x lives in the unit ball, so the c-ball point is x = u / sqrt(c)
+    and d_c(x, y) = d_1(u_x, u_y) / sqrt(c). With learn_c=False and c=1 this is the original geometry."""
+    c = property(lambda self: (self.log_c.exp().clamp(0.05, 5.0) if getattr(self, "learn_c", False) else self._c_init),
+                 lambda self, v: setattr(self, "_c_init", float(v)))
+
+    def __init__(self, in_features, n_classes, dim=64, c=1.0, learn_c=False, lr_c=1e-2, **kw):
+        super().__init__(in_features, n_classes, dim=dim, c=c, **kw)
+        self.learn_c, self.lr_c = learn_c, lr_c
+        if learn_c:
+            self.log_c = nn.Parameter(torch.tensor(float(np.log(c))))
+        t = self.proto_tangent.data
+        del self.proto_tangent
+        # same starting points as exp0 of the unit tangent prototypes at c=1
+        self.proto_u = nn.Parameter(torch.tanh(torch.tensor(1.0)) * t / t.norm(dim=-1, keepdim=True))
+
+    def prototypes(self):
+        return self.proto_u / self.c ** 0.5
+
+    def make_optimizers(self, lr, wd, lr_proto_mult=1.0):
+        special = {"proto_u", "log_c"}
+        main = [p for n, p in self.named_parameters() if n not in special]
+        opts = [torch.optim.AdamW(main, lr=lr, weight_decay=wd), RiemannianAdamBall([self.proto_u], lr=lr * lr_proto_mult)]
+        if self.learn_c:
+            opts.append(torch.optim.AdamW([self.log_c], lr=self.lr_c, weight_decay=0.0))
+        return opts
+
+    def post_step(self):
+        if self.learn_c:
+            with torch.no_grad():
+                self.log_c.clamp_(float(np.log(0.05)), float(np.log(5.0)))
+
+
+# ----------------------------------------------------------------------------- stage 2: MLP heads (Euclidean control and hyperbolic)
+def _init_mlp(self, in_features, hid, dim):
+    del self.proj
+    self.in_features_, self.hid = in_features, hid
+    self.l1 = nn.Linear(in_features, hid, bias=False)
+    self.l2 = nn.Linear(hid, dim, bias=False)
+    self.b1 = nn.Parameter(torch.zeros(hid))
+    self.b2 = nn.Parameter(torch.zeros(dim))
+
+
+def _hyp_mlp_tangent(self, feats):
+    """Hyperbolic MLP (Ganea et al. 2018): features enter the ball by exp0 (tangent norm ~1), then
+    Mobius matvec -> Mobius bias -> hyperbolic ReLU -> Mobius matvec -> Mobius bias; the result is returned as a tangent vector at the origin
+    (the norm control and the exp map of PoincareHead then apply as usual). At the origin Mobius matvec equals exp0(W log0(.)), so the only
+    place where this differs from a Euclidean MLP in the tangent space is the Mobius bias addition."""
+    c = self.c
+    x = self.feat_norm(feats.float()) / self.in_features_ ** 0.5
+    h = mobius_add(expmap0(self.l1(x), c), expmap0(self.b1.expand(x.shape[0], -1), c), c)
+    h = expmap0(torch.relu(self.log0(h)), c)
+    h = mobius_add(expmap0(self.l2(self.log0(h)), c), expmap0(self.b2.expand(x.shape[0], -1), c), c)
+    return self.log0(h)
+
+
+class EuclideanMLPHead(EuclideanHead):
+    """Control for the hyperbolic MLP: Linear-ReLU-Linear (same sizes, biases as plain vectors), Euclidean geometry."""
+    def __init__(self, in_features, n_classes, dim=64, hid=256, **kw):
+        super().__init__(in_features, n_classes, dim=dim, **kw)
+        del self.proj
+        self.mlp = nn.Sequential(nn.Linear(in_features, hid), nn.ReLU(), nn.Linear(hid, dim))
+
+    def _tangent(self, feats):
+        return self.mlp(self.feat_norm(feats.float()) / self.mlp[0].in_features ** 0.5)
+
+
+class HypMLPHead(PoincareHead):
+    def __init__(self, in_features, n_classes, dim=64, hid=256, **kw):
+        super().__init__(in_features, n_classes, dim=dim, **kw)
+        _init_mlp(self, in_features, hid, dim)
+
+    _tangent = _hyp_mlp_tangent
+
+
+class HypMLPRiemLCHead(RiemannianPoincareHead):
+    """Hyperbolic MLP + Riemannian prototypes + learnable curvature (stage 1 and 2 combined)."""
+    def __init__(self, in_features, n_classes, dim=64, hid=256, **kw):
+        super().__init__(in_features, n_classes, dim=dim, learn_c=True, **kw)
+        _init_mlp(self, in_features, hid, dim)
+
+    _tangent = _hyp_mlp_tangent
+
+
+# ----------------------------------------------------------------------------- hyperplane (MLR) heads and product-manifold head
+class HypMLRHead(PoincareHead):
+    """Hyperbolic multinomial logistic regression (Ganea et al. 2018): one gyroplane per class, defined by a point p_k on the ball
+    and a normal a_k. logit_k = (lambda_{p_k} |a_k| / sqrt(c)) * asinh( 2 sqrt(c) <(-p_k)(+)z, a_k> / ((1 - c|(-p_k)(+)z|^2) |a_k|) ),
+    times the same learnable inverse temperature as the other heads. Same embedding pipeline as PoincareHead."""
+    def __init__(self, in_features, n_classes, dim=64, **kw):
+        super().__init__(in_features, n_classes, dim=dim, **kw)
+        self.normal = nn.Parameter(torch.randn(n_classes, dim) / dim ** 0.5)
+        self.mlr_div = 1.0   # logit scale divisor (the learnable inverse temperature starts at 1/tau)
+
+    def forward(self, feats, return_embedding=False):
+        with torch.autocast("cuda", enabled=False):
+            z = self.embed(feats); c = self.c; sc = c ** 0.5
+            p = self.prototypes()                                             # (K,d) points on the ball
+            w = mobius_add(-p[None, :, :], z[:, None, :], c)                  # (B,K,d)
+            an = _norm(self.normal)                                           # (K,1)
+            lam = 2 / (1 - c * p.pow(2).sum(-1)).clamp_min(EPS)               # (K,)
+            num = 2 * sc * (w * self.normal[None]).sum(-1)
+            den = (1 - c * w.pow(2).sum(-1)).clamp_min(EPS) * an.squeeze(-1)[None]
+            logits = (lam * an.squeeze(-1) / sc)[None] * torch.asinh(num / den) * self.log_inv_tau.exp() / self.mlr_div
+        return (logits, z) if return_embedding else logits
+
+
+class EuclidMLRHead(EuclideanHead):
+    """Control for HypMLRHead: same pipeline, Euclidean hyperplanes: logit_k = <z - p_k, a_k> (times the inverse temperature)."""
+    def __init__(self, in_features, n_classes, dim=64, **kw):
+        super().__init__(in_features, n_classes, dim=dim, **kw)
+        self.normal = nn.Parameter(torch.randn(n_classes, dim) / dim ** 0.5)
+
+    def forward(self, feats, return_embedding=False):
+        z = self.embed(feats)
+        logits = ((z[:, None, :] - self.prototypes()[None]) * self.normal[None]).sum(-1) * self.log_inv_tau.exp()
+        return (logits, z) if return_embedding else logits
+
+
+class ProductHead(nn.Module):
+    """Product-manifold head: two sub-embeddings of dim/2 each (e.g. Euclidean x Poincare); the distance to a class prototype is
+    sqrt(d_1^2 + d_2^2). kinds = ("euclid","euclid") is the matched Euclidean control."""
+    def __init__(self, in_features, n_classes, dim=64, kinds=("euclid", "poincare"), tau=0.1, **kw):
+        super().__init__()
+        cls = {"euclid": EuclideanHead, "poincare": PoincareHead}
+        self.parts = nn.ModuleList([cls[k](in_features, n_classes, dim=dim // 2, tau=tau, **kw) for k in kinds])
+        self.h = dim // 2
+        self.log_inv_tau = nn.Parameter(torch.tensor(float(np.log(1.0 / tau))))
+
+    last_clipped_frac = property(lambda self: self.parts[0].last_clipped_frac)
+    last_preclip_norm = property(lambda self: self.parts[0].last_preclip_norm)
+
+    def _split(self, z):
+        return z[..., :self.h], z[..., self.h:]
+
+    def embed(self, feats):
+        return torch.cat([p.embed(feats) for p in self.parts], -1)
+
+    def prototypes(self):
+        return torch.cat([p.prototypes() for p in self.parts], -1)
+
+    def dist(self, x, y):
+        return sum(p.dist(a, b).pow(2) for p, a, b in zip(self.parts, self._split(x), self._split(y))).clamp_min(1e-12).sqrt()
+
+    def exp0(self, v):
+        return torch.cat([p.exp0(a) for p, a in zip(self.parts, self._split(v))], -1)
+
+    def log0(self, z):
+        return torch.cat([p.log0(a) for p, a in zip(self.parts, self._split(z))], -1)
+
+    def radius(self, z):
+        return sum(p.radius(a).pow(2) for p, a in zip(self.parts, self._split(z))).sqrt()
+
+    def make_optimizers(self, lr, wd, lr_proto_mult=1.0):
+        params = [p for n, p in self.named_parameters() if not n.startswith("parts.") or ".log_inv_tau" not in n]
+        return [torch.optim.AdamW(params, lr=lr, weight_decay=wd)]
+
+    def forward(self, feats, return_embedding=False):
+        with torch.autocast("cuda", enabled=False):
+            z = self.embed(feats)
+            logits = -self.dist(z, self.prototypes()) * self.log_inv_tau.exp()
+        return (logits, z) if return_embedding else logits
 
 
 class LinearHead(nn.Module):
@@ -226,6 +457,10 @@ def main():
     p.add_argument("--soft_t", type=float, default=0.0, help="temperature of tree-aware soft labels (0 = off)")
     p.add_argument("--soft_mix", type=float, default=0.8, help="weight of soft labels vs one-hot")
     p.add_argument("--depth_w", type=float, default=0.0, help="weight of the radius-vs-tree-depth loss")
+    p.add_argument("--con_w", type=float, default=0.0,
+                   help="weight of a supervised contrastive term on the embedding, using the head's own distance "
+                        "(hyperbolic for poincare, Euclidean for euclid) and its inverse temperature")
+    p.add_argument("--con_queue", type=int, default=1024, help="size of the cross-batch memory of past embeddings for --con_w")
     p.add_argument("--patience", type=int, default=15)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--experiment_name", default="Example-poincare")
@@ -298,6 +533,7 @@ def main():
             total += labels.size(0)
         return 100 * correct / total
 
+    q_z = q_y = None  # cross-batch memory for the contrastive term
     best, bad = 0.0, 0
     for epoch in range(a.epochs):
         model.train()
@@ -313,7 +549,7 @@ def main():
             images, labels = images.to(device), labels.to(device)
             images, ya, yb, lam = mixup(images, labels)
             optimizer.zero_grad()
-            if a.depth_w > 0:
+            if a.depth_w > 0 or a.con_w > 0:
                 logits, z = model(images, return_embedding=True)
             else:
                 logits = model(images)
@@ -329,6 +565,20 @@ def main():
                 r = model.head.radius(z)
                 dep = lam * depth_t[ya] + (1 - lam) * depth_t[yb]
                 loss = loss + a.depth_w * (r / r.mean().detach() - dep / dep.mean()).pow(2).mean()
+            if a.con_w > 0:  # supervised contrastive on the embedding; label of a mixed image = its dominant class
+                ydom = ya if lam >= 0.5 else yb
+                zq = z if q_z is None else torch.cat([z, q_z]); yq = ydom if q_y is None else torch.cat([ydom, q_y])
+                sim = -model.head.dist(z.float(), zq.float()) * model.head.log_inv_tau.exp()
+                eye = torch.zeros_like(sim, dtype=torch.bool); eye[:, :z.shape[0]] = torch.eye(z.shape[0], dtype=torch.bool, device=z.device)
+                sim = sim.masked_fill(eye, float("-inf"))
+                pos = (ydom[:, None] == yq[None]) & ~eye
+                logp = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+                npos = pos.sum(1)
+                if (npos > 0).any():
+                    lc = -(logp.masked_fill(~pos, 0.0)).sum(1)[npos > 0] / npos[npos > 0]
+                    loss = loss + a.con_w * lc.mean()
+                q_z = torch.cat([z.detach(), q_z])[:a.con_queue] if q_z is not None else z.detach()
+                q_y = torch.cat([ydom, q_y])[:a.con_queue] if q_y is not None else ydom
             if a.norm_pen > 0 and a.head in ("poincare", "euclid"):
                 loss = loss + a.norm_pen * torch.relu(model.head._v_norm - a.clip_r).pow(2).mean()
             if not torch.isfinite(loss):

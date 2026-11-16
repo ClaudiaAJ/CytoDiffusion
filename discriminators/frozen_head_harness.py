@@ -133,6 +133,18 @@ def placement(head, a, xte, yte, holdout_x):
     iu = np.triu_indices(len(names), 1)
     rho = spearmanr(Dc[iu], T[iu])[0]
     out = {"rho": rho, "radius": {n: float(head.radius(c)) for n, c in zip(names, C)}}
+    # radius-vs-depth: correlation over the known classes between centroid radius and leaf depth
+    # (depth the head was trained on, and depth in the true tree; identical unless --scramble)
+    from scipy.stats import pearsonr
+    nk0 = len(a.known_names)
+    rk = np.array([out["radius"][n] for n in names[:nk0]])
+    dtr = a.depth_t.cpu().numpy(); dtrue = np.array([class_tree.depth(n) for n in a.known_names], dtype=float)
+    def _corr(f, x, y):
+        return float(f(x, y)[0]) if np.std(x) > 0 and np.std(y) > 0 else float("nan")
+    out["rd"] = (_corr(pearsonr, rk, dtr), _corr(spearmanr, rk, dtr), _corr(pearsonr, rk, dtrue), _corr(spearmanr, rk, dtrue))
+    if getattr(a, "scramble", 0) > 0:  # fit to the (nonsense) tree the head was trained on, over the known classes
+        nk = len(a.known_names); iuk = np.triu_indices(nk, 1)
+        out["rho_train"] = spearmanr(Dc[:nk, :nk][iuk], class_tree.tree_distance_matrix(a.train_names)[iuk])[0]
     if holdout_x is not None:
         j = len(names) - 1
         order = np.argsort(Dc[j, :j])
@@ -149,11 +161,31 @@ def run_head(name, a, data, device, seed, holdout_x=None, return_head=False):
     if name == "linear":
         head = hyp.LinearHead(xtr.shape[1], n_classes)
     else:
-        cls = hyp.EuclideanHead if name == "euclid" else hyp.PoincareHead
+        extra = {}
+        if name == "poincare_riem":
+            cls = hyp.RiemannianPoincareHead
+        elif name == "poincare_riem_lc":
+            cls, extra = hyp.RiemannianPoincareHead, dict(learn_c=True, lr_c=a.lr_c)
+        elif name == "euclid_mlp":
+            cls, extra = hyp.EuclideanMLPHead, dict(hid=a.hid)
+        elif name == "poincare_mlp":
+            cls, extra = hyp.HypMLPHead, dict(hid=a.hid)
+        elif name == "poincare_mlr":
+            cls = hyp.HypMLRHead
+        elif name == "euclid_mlr":
+            cls = hyp.EuclidMLRHead
+        elif name in ("prod_ee", "prod_eh", "prod_hh"):
+            cls, extra = hyp.ProductHead, dict(kinds={"prod_ee": ("euclid", "euclid"), "prod_eh": ("euclid", "poincare"), "prod_hh": ("poincare", "poincare")}[name])
+        elif name == "poincare_mlp_riem_lc":
+            cls, extra = hyp.HypMLPRiemLCHead, dict(hid=a.hid, lr_c=a.lr_c)
+        else:
+            cls = hyp.EuclideanHead if name == "euclid" else hyp.PoincareHead
         head = cls(xtr.shape[1], n_classes, dim=a.dim, c=a.c, clip_r=a.clip_r, tau=a.tau,
-                                  norm_mode=a.norm_mode, target_norm=a.target_norm)
+                                  norm_mode=a.norm_mode, target_norm=a.target_norm, **extra)
     head = head.to(device)
-    opt = torch.optim.AdamW(head.parameters(), lr=a.lr, weight_decay=a.wd)
+    with torch.no_grad():
+        p_init = head.prototypes().detach().clone() if hasattr(head, "prototypes") else None
+    opts = head.make_optimizers(a.lr, a.wd, a.lr_proto_mult) if hasattr(head, "make_optimizers") else [torch.optim.AdamW(head.parameters(), lr=a.lr, weight_decay=a.wd)]
     n, best_val, best_test, best_bal, rows = xtr.shape[0], -1.0, 0.0, 0.0, []
     for step in range(1, a.steps + 1):
         head.train()
@@ -172,7 +204,7 @@ def run_head(name, a, data, device, seed, holdout_x=None, return_head=False):
                 return oh
             q = lam * tgt(yb) + (1 - lam) * tgt(yb2)
             loss = -(q * F.log_softmax(out, dim=1)).sum(1).mean()
-            if a.depth_w > 0 and name in ("poincare", "euclid"):
+            if a.depth_w > 0 and name != "linear":
                 r = head.radius(z); dep = lam * a.depth_t[yb] + (1 - lam) * a.depth_t[yb2]
                 loss = loss + a.depth_w * (r / r.mean().detach() - dep / dep.mean()).pow(2).mean()
         else:
@@ -183,11 +215,11 @@ def run_head(name, a, data, device, seed, holdout_x=None, return_head=False):
                 loss = -(q * F.log_softmax(out, dim=1)).sum(1).mean()
             else:
                 loss = F.cross_entropy(out, yb)
-            if a.depth_w > 0 and name in ("poincare", "euclid"):
+            if a.depth_w > 0 and name != "linear":
                 # radius should grow with tree depth: relative radius r/mean(r) -> depth/mean(depth)
                 r = head.radius(z); dep = a.depth_t[yb]
                 loss = loss + a.depth_w * (r / r.mean().detach() - dep / dep.mean()).pow(2).mean()
-        if a.tree_w > 0 and name in ("poincare", "euclid"):  # match prototype-to-prototype hyperbolic distance to scaled tree distance
+        if a.tree_w > 0 and name != "linear":  # match prototype-to-prototype hyperbolic distance to scaled tree distance
             P = head.prototypes()
             Dp = head.dist(P, P)
             iu = torch.triu_indices(P.shape[0], P.shape[0], 1, device=P.device)
@@ -195,7 +227,13 @@ def run_head(name, a, data, device, seed, holdout_x=None, return_head=False):
         if not torch.isfinite(loss):
             print(f"  [{name}] non-finite loss at step {step}")
             break
-        opt.zero_grad(); loss.backward(); opt.step()
+        for o in opts:
+            o.zero_grad()
+        loss.backward()
+        for o in opts:
+            o.step()
+        if hasattr(head, "post_step"):
+            head.post_step()
         if step % a.eval_every == 0 or step == a.steps:
             va, te, tr = acc(head, xva, yva), acc(head, xte, yte), acc(head, xtr, ytr)
             with torch.no_grad():
@@ -212,7 +250,24 @@ def run_head(name, a, data, device, seed, holdout_x=None, return_head=False):
         with torch.no_grad():
             r = head.radius(head.embed(xte))
         rad = (r.mean().item(), (r.std() / r.mean()).item())
-    if name in ("poincare", "euclid"):
+    a.last_c = float(head.c) if getattr(head, "learn_c", False) else None
+    a.last_capfrac = 0.0  # share of test sample-prototype distances at the distance cap (hyperbolic prototype heads only)
+    if isinstance(head, hyp.PoincareHead) and not isinstance(head, hyp.EuclideanHead):
+        head.eval()
+        with torch.no_grad():
+            a.last_capfrac = hyp.frac_at_cap(head.dist(head.embed(xte), head.prototypes()), float(head.c))
+        if a.last_capfrac > 0:
+            print(f"  WARNING [{name} seed={seed}]: {100 * a.last_capfrac:.2f}% of test sample-prototype distances are at the "
+                  f"distance cap {hyp.max_dist(float(head.c)):.2f}; distances above it are not resolved")
+    a.last_move = None
+    if p_init is not None and name != "linear":  # how far did each prototype travel (head distance), vs the mean distance between prototypes at init
+        with torch.no_grad():
+            p_fin = head.prototypes().detach()
+            mv = torch.diag(head.dist(p_init, p_fin)).mean().item()
+            D0 = head.dist(p_init, p_init); k = D0.shape[0]
+            inter = (D0.sum() / (k * (k - 1))).item()
+        a.last_move = (mv, inter)
+    if name != "linear":
         a.last_placement = placement(head, a, xte, yte, holdout_x)
     if return_head:
         return rows, best_val, best_test, auc, best_bal, rad, head
@@ -227,7 +282,7 @@ def main():
     p.add_argument("--cache", default="features_cache.npz")
     p.add_argument("--rebuild", action="store_true")
     p.add_argument("--aug_copies", type=int, default=0, help="extra augmented views of the train set in the cache")
-    p.add_argument("--heads", nargs="+", default=["linear", "poincare"], choices=["linear", "poincare", "euclid"])
+    p.add_argument("--heads", nargs="+", default=["linear", "poincare"], choices=["linear", "poincare", "euclid", "poincare_riem", "poincare_riem_lc", "euclid_mlp", "poincare_mlp", "poincare_mlp_riem_lc", "poincare_mlr", "euclid_mlr", "prod_ee", "prod_eh", "prod_hh"])
     p.add_argument("--dim", type=int, default=64)
     p.add_argument("--c", type=float, default=1.0)
     p.add_argument("--clip_r", type=float, default=2.0)
@@ -237,6 +292,9 @@ def main():
     p.add_argument("--tau", type=float, default=0.1)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--wd", type=float, default=1e-2)
+    p.add_argument("--lr_proto_mult", type=float, default=1.0, help="learning-rate multiplier for the class prototypes")
+    p.add_argument("--lr_c", type=float, default=1e-2, help="learning rate of the learnable curvature")
+    p.add_argument("--hid", type=int, default=256, help="hidden width of the MLP heads")
     p.add_argument("--steps", type=int, default=300)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--eval_every", type=int, default=50)
@@ -249,6 +307,9 @@ def main():
     p.add_argument("--soft_t", type=float, default=0.0, help="temperature of tree-aware soft labels (0 = off)")
     p.add_argument("--soft_mix", type=float, default=0.5, help="weight of soft labels vs one-hot")
     p.add_argument("--depth_w", type=float, default=0.0, help="weight on the radius-vs-tree-depth loss")
+    p.add_argument("--scramble", type=int, default=0,
+                   help="control: train with the tree but with the classes randomly re-assigned to its leaves (derangement from this seed); "
+                        "all placement metrics are still measured against the true tree")
     p.add_argument("--quiet", action="store_true", help="only print the summary")
     p.add_argument("--seeds", type=int, nargs="+", default=[0])
     a = p.parse_args()
@@ -270,8 +331,18 @@ def main():
     classes = [str(c) for c in d["classes"]]
     a.held_name = classes[a.holdout] if a.holdout is not None else None
     a.known_names = [c for i, c in enumerate(classes) if i != a.holdout]
-    a.depth_t = torch.tensor([float(class_tree.depth(n)) for n in a.known_names], device=device)
-    a.tree_T = torch.tensor(class_tree.tree_distance_matrix(a.known_names), dtype=torch.float32, device=device)
+    a.train_names = list(a.known_names)
+    if a.scramble > 0:  # nonsense hierarchy: each class takes the tree position of a different class
+        rs = np.random.RandomState(a.scramble)
+        while True:
+            pm = rs.permutation(len(classes))
+            if not (pm == np.arange(len(classes))).any():
+                break
+        pos = {c: classes[pm[i]] for i, c in enumerate(classes)}
+        a.train_names = [pos[n] for n in a.known_names]
+        print("scrambled tree positions: " + ", ".join(f"{c}->{pos[c]}" for c in classes))
+    a.depth_t = torch.tensor([float(class_tree.depth(n)) for n in a.train_names], device=device)
+    a.tree_T = torch.tensor(class_tree.tree_distance_matrix(a.train_names), dtype=torch.float32, device=device)
 
     summary = {}
     placements = []
@@ -284,11 +355,18 @@ def main():
                 print(" step  trainCE  train%  val%  test%  clipped  preclip|v|  mean|proto|")
                 for r in rows:
                     print(f" {r[0]:4d}  {r[1]:7.3f}  {r[2]:6.1f}  {r[3]:5.1f} {r[4]:6.1f}  {r[5]:7.2f}  {r[6]:10.2f}  {r[7]:11.3f}")
-            if name in ("poincare", "euclid"):
+            if name != "linear":
                 pl = a.last_placement
                 msg = f"  placement: spearman(emb dist, tree dist)={pl['rho']:.3f}"
                 if "rank" in pl:
                     msg += f" | held '{a.held_name}' nearest known: " + ", ".join(f"{n}(T={t})" for n, _, t in pl["rank"][:3]) + f" -> tree dist {pl['nearest_tree']} (best possible {pl['min_possible']}) | held radius/known mean {pl['radius'][a.held_name] / np.mean([v for k, v in pl['radius'].items() if k != a.held_name]):.2f} (depth {class_tree.depth(a.held_name)})"
+                msg += f" | raddepth_train pearson={pl['rd'][0]:.3f} spearman={pl['rd'][1]:.3f} | raddepth_true pearson={pl['rd'][2]:.3f} spearman={pl['rd'][3]:.3f}"
+                if a.last_move is not None:
+                    msg += f" | proto_move={a.last_move[0]:.3f} inter_proto={a.last_move[1]:.2f}"
+                if a.last_c is not None:
+                    msg += f" | c_final={a.last_c:.3f}"
+                if "rho_train" in pl:
+                    msg += f" | rho_vs_trained_tree={pl['rho_train']:.3f}"
                 print(msg)
                 placements.append(pl)
             summary.setdefault(name, []).append((bv, bt, rows[-1][4] if rows else float("nan"), auc[0], auc[1], auc[2], np.mean([r[5] for r in rows[-1:]]), rows[-1][6], bb, rows[-1][8], rad[0], rad[1]))
@@ -296,9 +374,9 @@ def main():
     for name, v in summary.items():
         v = np.array(v); m, sd = v.mean(0), v.std(0)
         extra = f"  AUROC maxlogit {m[3]:.3f}+-{sd[3]:.3f} MSP {m[4]:.3f}+-{sd[4]:.3f} origin-dist {m[5]:.3f}+-{sd[5]:.3f}  [clipped {m[6]:.2f}, preclip|v| {m[7]:.1f}]" if a.holdout is not None else ""
-        if name in ("poincare", "euclid"):
+        if name != "linear":
             extra += f"  | radius mean {m[10]:.2f} cv {m[11]:.3f}"
-        print(f"  {name:9s} test@bestval {m[1]:5.1f}+-{sd[1]:.1f}  test@final {m[2]:5.1f}+-{sd[2]:.1f}  | balanced: @bestval {m[8]:5.1f}+-{sd[8]:.1f} @final {m[9]:5.1f}+-{sd[9]:.1f}{extra}")
+        print(f"  {name:9s} test@bestval {m[1]:5.1f}+-{sd[1]:.1f}  test@final {m[2]:5.1f}+-{sd[2]:.1f}  | balanced: @bestval {m[8]:5.1f}+-{sd[8]:.1f} @final {m[9]:5.1f}+-{sd[9]:.1f}{extra}  | valacc@best {m[0]:5.2f}")
 
 
 if __name__ == "__main__":
