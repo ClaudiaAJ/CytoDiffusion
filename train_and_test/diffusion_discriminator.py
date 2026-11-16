@@ -91,6 +91,17 @@ DATASET_NAME_MAPPING = {
 }
 
 
+def str2bool(v):
+    """Parse boolean CLI values such as --flag=False (plain argparse treats any non-empty string as True)."""
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("true", "1", "yes", "y"):
+        return True
+    if v.lower() in ("false", "0", "no", "n"):
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got {v!r}")
+
+
 def str_to_float_list(s):
     try:
         # Convert string representation of list into actual list
@@ -1842,22 +1853,26 @@ def parse_args():
     )
     parser.add_argument(
         "--validate_at_the_end",
+        type=str2bool,
         default=False,
         help="Whether to validate the model on the validation set and the end of the training. Can be used with nr_steps = 0.",
     )
 
     parser.add_argument(
         "--save_at_end",
+        type=str2bool,
         default=True,
         help="Whether to save the model at the end of the training.",
     )
     parser.add_argument(
         "--random_augment",
+        type=str2bool,
         default=False,
         help="Whether to use random augmentations.",
     )
     parser.add_argument(
         "--random_augment_validation",
+        type=str2bool,
         default=False,
         help="Whether to use random augmentations.",
     )
